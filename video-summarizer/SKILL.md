@@ -16,6 +16,7 @@ Extract subtitles/transcripts from video platforms and generate structured notes
 | Douyin (抖音) | `douyin.com/`, `v.douyin.com/` | `yt-dlp` |
 | Xiaohongshu (小红书) | `xiaohongshu.com/`, `xhslink.com/` | `yt-dlp` |
 | TikTok | `tiktok.com/` | `yt-dlp` |
+| DeepLearning.AI Learn | `learn.deeplearning.ai/courses/.../lesson/...` | Next.js embedded caption data |
 | Any other | Any URL supported by yt-dlp (1800+ sites) | `yt-dlp` |
 
 ## Prerequisites
@@ -42,6 +43,8 @@ pip install youtube-transcript-api
 pip install yt-dlp
 ```
 
+**For DeepLearning.AI Learn lesson pages:** no extra dependency is required for public/preview pages that embed captions in `__NEXT_DATA__`. The extractor reads the page's dehydrated tRPC data (`course.getLessonVideoSubtitle`) and returns `source: next_data_captions`.
+
 **Optional -- Whisper transcription** (for videos without subtitles):
 - OpenAI API mode: `pip install openai`
 - Local mode: `pip install faster-whisper`
@@ -67,6 +70,12 @@ Run the extraction script with the video URL:
 
 ```bash
 python "<skill_path>/video_subtitle.py" "<VIDEO_URL>"
+```
+
+If dependencies are installed in the skill-local virtualenv, use:
+
+```bash
+"<skill_path>/.venv/bin/python" "<skill_path>/video_subtitle.py" "<VIDEO_URL>"
 ```
 
 Replace `<skill_path>` with the absolute path to this skill's directory, and `<VIDEO_URL>` with the video URL provided by the user.
@@ -225,3 +234,7 @@ To enable/disable, edit `config.json`:
 - `frames_per_video`: number of evenly-spaced frames to extract (default `6`)
 
 Screenshots are cached in the `screenshots/` directory. If ffmpeg is not installed, frame extraction is silently skipped.
+
+### DeepLearning.AI keyframe troubleshooting
+
+For `learn.deeplearning.ai` lesson pages, captions come from Next.js `__NEXT_DATA__` (`course.getLessonVideoSubtitle`) and video playback usually comes from a CloudFront `.m3u8`/mp4 URL in the same page data. Keyframes should be extracted by passing this `video_url` through `_play_url` to `extract_keyframes`; ffmpeg can read the `.m3u8` directly, so do not rely on yt-dlp understanding the lesson page URL. If a previous run was cached before frames were enabled, ensure the cache-backfill path adds `frames` when `extract_frames=true` and cached subtitles exist, or clear cache with `python video_subtitle.py --clear-cache` and rerun.

@@ -19,6 +19,7 @@ Fallback chain:
 import glob
 import gzip
 import hashlib
+import html
 import io
 import json
 import os
@@ -137,6 +138,9 @@ PLATFORM_PATTERNS = [
     ]),
     ("tiktok", [
         r"tiktok\.com/",
+    ]),
+    ("deeplearning_ai", [
+        r"learn\.deeplearning\.ai/courses/",
     ]),
 ]
 
@@ -512,6 +516,109 @@ def _fill_youtube_info(info, video_id):
         info["author"] = data.get("author_name", "")
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# DeepLearning.AI lesson extractor (Next.js page data)
+# ---------------------------------------------------------------------------
+
+def extract_deeplearning_ai(url):
+    """Extract metadata and captions from public DeepLearning.AI lesson pages.
+
+    The lesson page embeds dehydrated tRPC query results in __NEXT_DATA__, including
+    getLessonVideo and getLessonVideoSubtitle for preview-access lessons. This avoids
+    needing to download the video or sign in when captions are present in the page.
+    """
+    try:
+        page = http_get(url, headers={
+            **DEFAULT_HEADERS,
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        })
+        m = re.search(r'<script[^>]+id=["\']__NEXT_DATA__["\'][^>]*>(.*?)</script>', page, re.DOTALL)
+        if not m:
+            return None
+        next_data = json.loads(html.unescape(m.group(1)))
+        page_props = next_data.get("props", {}).get("pageProps", {})
+        queries = page_props.get("trpcState", {}).get("json", {}).get("queries", [])
+
+        captions = []
+        video = {}
+        course = {}
+        lesson_name = ""
+        lesson_slug = ""
+
+        # Pull lesson slug from /lesson/<slug>/... URL when available.
+        slug_match = re.search(r"/lesson/([^/]+)/", url)
+        if slug_match:
+            lesson_slug = urllib.parse.unquote(slug_match.group(1))
+
+        for q in queries:
+            state_data = q.get("state", {}).get("data", {}) or {}
+            query_key = q.get("queryKey", [])
+            query_name = ""
+            try:
+                query_name = ".".join(query_key[0])
+            except Exception:
+                pass
+
+            if query_name == "course.getCourseBySlug":
+                course = state_data
+                lessons = course.get("lessons", {}) or {}
+                if lesson_slug and lesson_slug in lessons:
+                    lesson_name = lessons[lesson_slug].get("name", "")
+            elif query_name == "course.getLessonVideo":
+                video = state_data.get("video", {}) or {}
+            elif query_name == "course.getLessonVideoSubtitle":
+                captions = state_data.get("captions", []) or []
+
+        if not lesson_name:
+            lesson_name = video.get("name") or "DeepLearning.AI lesson"
+
+        info = {
+            "title": lesson_name,
+            "author": "DeepLearning.AI",
+            "duration": 0,
+            "description": course.get("wpData", {}).get("courseDescription", "") if course else "",
+        }
+        if lesson_slug and course.get("lessons", {}).get(lesson_slug):
+            info["duration"] = course["lessons"][lesson_slug].get("time", 0) or 0
+
+        lines = []
+        for item in captions:
+            text = (item.get("text") or "").strip()
+            if text:
+                lines.append(text)
+        subtitle_text = "\n".join(lines)
+        if subtitle_text:
+            result = _make_result(info, "deeplearning_ai", url, subtitle_text, "next_data_captions")
+            if video:
+                video_url = video.get("mp4Url") or video.get("mp4360pUrl") or ""
+                result["video_url"] = video_url
+                if video_url:
+                    result["_play_url"] = video_url
+            return result
+
+        # Fallback to VTT track URL in Next data if captions query is absent.
+        tracks = video.get("tracks") or []
+        for track in tracks:
+            src = track.get("src")
+            if src:
+                try:
+                    vtt = http_get(src, headers=DEFAULT_HEADERS)
+                    text = _parse_vtt_srt(vtt)
+                    if text:
+                        result = _make_result(info, "deeplearning_ai", url, text, "vtt_subtitle")
+                        video_url = video.get("mp4Url") or video.get("mp4360pUrl") or ""
+                        if video_url:
+                            result["video_url"] = video_url
+                            result["_play_url"] = video_url
+                        return result
+                except Exception as e:
+                    log(f"DeepLearning.AI VTT fetch failed: {e}", "WARN")
+        return _make_result(info, "deeplearning_ai", url)
+    except Exception as e:
+        log(f"DeepLearning.AI extraction failed: {e}", "WARN")
+        return None
 
 
 # ---------------------------------------------------------------------------
@@ -1307,6 +1414,11 @@ def extract_keyframes(url, platform, config, play_url=None, duration=None):
             video_path = _download_douyin_audio(play_url, tmp_dir)
         elif play_url and platform == "xiaohongshu":
             video_path = _download_xhs_video(play_url, tmp_dir)
+        elif play_url and platform == "deeplearning_ai":
+            # DeepLearning.AI exposes a signed/temporary CloudFront .m3u8 or mp4 URL
+            # in Next.js page data. ffmpeg can read both directly, so avoid asking
+            # yt-dlp to understand the lesson page URL.
+            video_path = play_url
 
         if not video_path and _check_ytdlp():
             log("Downloading video for frame extraction...")
@@ -1534,6 +1646,17 @@ def extract(url, config):
     # Phase 0: check cache
     cached = _read_cache(url)
     if cached:
+        # Older cache entries may have subtitles but no frames because frame extraction
+        # was disabled or platform-specific play_url wiring was missing. If frames are
+        # now enabled, backfill screenshots instead of returning stale cache as-is.
+        if config.get("extract_frames", True) and not cached.get("frames") and cached.get("subtitle_text"):
+            cached_platform = cached.get("platform") or detect_platform(url)
+            cached_play_url = cached.get("_play_url") or cached.get("video_url")
+            cached_duration = (cached.get("info") or {}).get("duration", 0)
+            frames = extract_keyframes(url, cached_platform, config, play_url=cached_play_url, duration=cached_duration)
+            if frames:
+                cached["frames"] = frames
+                _write_cache(url, cached)
         return cached
 
     platform = detect_platform(url)
@@ -1547,13 +1670,15 @@ def extract(url, config):
         result = extract_bilibili(url)
     elif platform == "youtube":
         result = extract_youtube(url)
+    elif platform == "deeplearning_ai":
+        result = extract_deeplearning_ai(url)
     elif platform == "douyin":
         result = extract_douyin(url)
     elif platform == "xiaohongshu":
         result = extract_xiaohongshu(url)
 
     if result:
-        play_url = result.get("_play_url")
+        play_url = result.get("_play_url") or result.get("video_url")
 
     final_result = None
 
